@@ -12,13 +12,12 @@ import {
   getCompany,
   getFilingHistory,
   getOfficers,
-  normalizeCompanyNumber,
   searchCompanies,
   type CompanyProfile,
 } from "./companiesHouse.js";
 import { companyType, describeFiling, formatAddress, postcodeLines, readable } from "./format.js";
 import { UserFacingError } from "./http.js";
-import { isUkPostcode, lookupPostcode } from "./postcodes.js";
+import { PostcodeInfoSchema, isUkPostcode, lookupPostcode, type PostcodeInfo } from "./postcodes.js";
 
 export const SERVER_NAME = "uk-business-mcp";
 export const SERVER_VERSION = "0.1.0";
@@ -65,10 +64,42 @@ function textResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }] };
 }
 
-function companySummary(c: CompanyProfile) {
+// `.describe()` before `.nullable()` makes the JSON Schema an `anyOf` instead of a
+// type array (["string","null"]), which more MCP clients accept.
+const nullableText = (description: string) => z.string().describe(description).nullable();
+
+/** get_company's structured output. Used as its outputSchema and as companySummary's return type. */
+const CompanySummarySchema = z.object({
+  companyNumber: z.string(),
+  name: z.string(),
+  status: z.string(),
+  type: z.string(),
+  incorporatedOn: nullableText("Incorporation date (YYYY-MM-DD)"),
+  dissolvedOn: nullableText("Dissolution date (YYYY-MM-DD), if dissolved"),
+  registeredOffice: nullableText("Registered office address"),
+  postcode: nullableText("Registered office postcode"),
+  sicCodes: z.array(z.string()),
+  accountsNextDue: nullableText("Date the next accounts are due"),
+  accountsOverdue: z.boolean(),
+  lastAccountsMadeUpTo: nullableText("Date the last accounts were made up to"),
+  confirmationStatementNextDue: nullableText("Date the next confirmation statement is due"),
+  confirmationStatementOverdue: z.boolean(),
+  hasCharges: z.boolean(),
+  hasInsolvencyHistory: z.boolean(),
+  warnings: z.array(z.string()),
+});
+type CompanySummary = z.infer<typeof CompanySummarySchema>;
+
+// Statuses that mean the company is live. Overseas companies use "open", and
+// registered overseas entities use "registered", instead of "active".
+const LIVE_STATUSES = new Set(["active", "open", "registered"]);
+
+function companySummary(c: CompanyProfile): CompanySummary {
   const status = readable(c.company_status);
   const warnings: string[] = [];
-  if (c.company_status && c.company_status !== "active") warnings.push(`Company status is "${status}", not active.`);
+  if (c.company_status && !LIVE_STATUSES.has(c.company_status)) {
+    warnings.push(`Company status is "${status}", not active.`);
+  }
   if (c.accounts?.overdue) warnings.push(`Accounts are overdue (were due ${c.accounts.next_due ?? "on an unknown date"}).`);
   if (c.confirmation_statement?.overdue) {
     warnings.push(
@@ -148,25 +179,7 @@ export function createServer(): McpServer {
         "SIC codes, accounts and confirmation statement due dates, and warnings such as overdue accounts or " +
         "insolvency history. Good for supplier or customer due diligence.",
       inputSchema: { company_number: companyNumberField },
-      outputSchema: {
-        companyNumber: z.string(),
-        name: z.string(),
-        status: z.string(),
-        type: z.string(),
-        incorporatedOn: z.string().nullable(),
-        dissolvedOn: z.string().nullable(),
-        registeredOffice: z.string().nullable(),
-        postcode: z.string().nullable(),
-        sicCodes: z.array(z.string()),
-        accountsNextDue: z.string().nullable(),
-        accountsOverdue: z.boolean(),
-        lastAccountsMadeUpTo: z.string().nullable(),
-        confirmationStatementNextDue: z.string().nullable(),
-        confirmationStatementOverdue: z.boolean(),
-        hasCharges: z.boolean(),
-        hasInsolvencyHistory: z.boolean(),
-        warnings: z.array(z.string()),
-      },
+      outputSchema: CompanySummarySchema.shape,
       annotations: READ_ONLY,
     },
     async ({ company_number }) => {
@@ -207,8 +220,13 @@ export function createServer(): McpServer {
     },
     async ({ company_number, include_resigned, limit }) => {
       try {
-        const n = normalizeCompanyNumber(company_number);
-        const { items = [], active_count, resigned_count, total_results } = await getOfficers(n);
+        const { companyNumber: n, officers } = await getOfficers(company_number, {
+          includeResigned: include_resigned,
+          limit,
+        });
+        if (!officers) return textResult(`Companies House has no officer records for company ${n}.`);
+
+        const { items = [], active_count, resigned_count, total_results } = officers;
         const active = active_count ?? items.filter((o) => !o.resigned_on).length;
         const resigned = resigned_count ?? items.filter((o) => o.resigned_on).length;
         const matching = include_resigned ? items : items.filter((o) => !o.resigned_on);
@@ -252,8 +270,10 @@ export function createServer(): McpServer {
     },
     async ({ company_number, category, limit }) => {
       try {
-        const n = normalizeCompanyNumber(company_number);
-        const { items = [], total_count } = await getFilingHistory(n, { limit, category });
+        const { companyNumber: n, filings } = await getFilingHistory(company_number, { limit, category });
+        if (!filings) return textResult(`Companies House has no filing history for company ${n}.`);
+
+        const { items = [], total_count } = filings;
         const filter = category ? ` (${readable(category)})` : "";
         if (items.length === 0) return textResult(`No filings found for company ${n}${filter}.`);
 
@@ -277,16 +297,7 @@ export function createServer(): McpServer {
         "Get the area for a UK postcode: local authority, region, country, ward, parliamentary constituency and coordinates. " +
         "Region is only set for England.",
       inputSchema: { postcode: postcodeField },
-      outputSchema: {
-        postcode: z.string(),
-        country: z.string(),
-        region: z.string().nullable(),
-        localAuthority: z.string().nullable(),
-        ward: z.string().nullable(),
-        constituency: z.string().nullable(),
-        latitude: z.number().nullable(),
-        longitude: z.number().nullable(),
-      },
+      outputSchema: PostcodeInfoSchema.shape,
       annotations: READ_ONLY,
     },
     async ({ postcode }) => {
@@ -327,7 +338,15 @@ export function createServer(): McpServer {
         if (!postcode || !isUkPostcode(postcode)) {
           return textResult(`${header}\nNo UK postcode on record, so no area details are available.`);
         }
-        const info = await lookupPostcode(postcode);
+        let info: PostcodeInfo | null;
+        try {
+          info = await lookupPostcode(postcode);
+        } catch (err) {
+          // Keep the company and address we already have. Only the area details are missing.
+          console.error(`[${SERVER_NAME}] postcode lookup failed:`, err);
+          const reason = err instanceof UserFacingError ? err.message : "The postcode lookup failed.";
+          return textResult(`${header}\nArea details are not available right now: ${reason}`);
+        }
         if (!info) {
           return textResult(`${header}\nPostcode ${postcode} was not found on postcodes.io (it may be new or retired).`);
         }

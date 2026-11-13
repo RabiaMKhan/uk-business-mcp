@@ -5,7 +5,8 @@
  * Note: `region` is only set for England. Scotland, Wales and Northern Ireland return null.
  */
 import { z } from "zod";
-import { UserFacingError, fetchWithTimeout } from "./http.js";
+import { compact } from "./format.js";
+import { UserFacingError, getJson } from "./http.js";
 
 const BASE_URL = "https://api.postcodes.io";
 const SERVICE = "postcodes.io";
@@ -13,16 +14,23 @@ const SERVICE = "postcodes.io";
 // Outward code (A9, A99, AA9, AA99, A9A, AA9A) + inward code (9AA), with no space.
 const POSTCODE_PATTERN = /^[A-Z]{1,2}[0-9][A-Z0-9]?[0-9][A-Z]{2}$/;
 
-export interface PostcodeInfo {
-  postcode: string;
-  country: string;
-  region: string | null;
-  localAuthority: string | null;
-  ward: string | null;
-  constituency: string | null;
-  latitude: number | null;
-  longitude: number | null;
-}
+/**
+ * What a postcode lookup returns. lookup_postcode also uses this as its outputSchema,
+ * so the type and the schema can't drift apart.
+ * `.describe()` before `.nullable()` makes the JSON Schema an `anyOf` instead of a
+ * type array (["string","null"]), which more MCP clients accept.
+ */
+export const PostcodeInfoSchema = z.object({
+  postcode: z.string(),
+  country: z.string(),
+  region: z.string().describe("Region (England only)").nullable(),
+  localAuthority: z.string().describe("Local authority (council) area").nullable(),
+  ward: z.string().describe("Electoral ward").nullable(),
+  constituency: z.string().describe("Parliamentary constituency").nullable(),
+  latitude: z.number().describe("Latitude").nullable(),
+  longitude: z.number().describe("Longitude").nullable(),
+});
+export type PostcodeInfo = z.infer<typeof PostcodeInfoSchema>;
 
 const LookupSchema = z.object({
   result: z.object({
@@ -37,10 +45,6 @@ const LookupSchema = z.object({
   }),
 });
 
-function compact(input: string): string {
-  return input.replace(/\s+/g, "").toUpperCase();
-}
-
 export function isUkPostcode(input: string): boolean {
   return POSTCODE_PATTERN.test(compact(input));
 }
@@ -53,13 +57,13 @@ export async function lookupPostcode(input: string): Promise<PostcodeInfo | null
   }
 
   const url = new URL(`/postcodes/${encodeURIComponent(postcode)}`, BASE_URL);
-  const res = await fetchWithTimeout(url, SERVICE, { headers: { Accept: "application/json" } });
+  const data = await getJson(url, LookupSchema, {
+    service: SERVICE,
+    statusMessages: { 429: "postcodes.io rate limit reached. Wait a minute and try again." },
+  });
+  if (data === null) return null;
 
-  if (res.status === 404) return null;
-  if (res.status === 429) throw new UserFacingError("postcodes.io rate limit reached. Wait a minute and try again.");
-  if (!res.ok) throw new UserFacingError(`postcodes.io returned HTTP ${res.status}. Please try again later.`);
-
-  const { result: r } = LookupSchema.parse(await res.json());
+  const r = data.result;
   return {
     postcode: r.postcode,
     country: r.country,

@@ -13,8 +13,9 @@
  * - We parse only the fields we need. Zod drops everything else, so personal
  *   data we don't need (officers' dates of birth, home addresses) never reaches the model.
  */
-import { z } from "zod";
-import { UserFacingError, fetchWithTimeout } from "./http.js";
+import { z, type ZodType } from "zod";
+import { compact } from "./format.js";
+import { UserFacingError, getJson } from "./http.js";
 
 const BASE_URL = "https://api.company-information.service.gov.uk";
 const SERVICE = "Companies House";
@@ -78,20 +79,19 @@ const ProfileSchema = z.object({
 });
 export type CompanyProfile = z.infer<typeof ProfileSchema>;
 
+const OfficerSchema = z.object({
+  name: z.string(),
+  officer_role: z.string(),
+  appointed_on: z.string().optional(),
+  resigned_on: z.string().optional(),
+});
+type Officer = z.infer<typeof OfficerSchema>;
+
 const OfficersSchema = z.object({
   total_results: z.number().optional(),
   active_count: z.number().optional(),
   resigned_count: z.number().optional(),
-  items: z
-    .array(
-      z.object({
-        name: z.string(),
-        officer_role: z.string(),
-        appointed_on: z.string().optional(),
-        resigned_on: z.string().optional(),
-      }),
-    )
-    .optional(),
+  items: z.array(OfficerSchema).optional(),
 });
 export type OfficerList = z.infer<typeof OfficersSchema>;
 
@@ -135,7 +135,7 @@ export type FilingCategory = (typeof FILING_CATEGORIES)[number];
  * Throws a helpful error if it can't be a UK company number.
  */
 export function normalizeCompanyNumber(input: string): string {
-  let n = input.replace(/\s+/g, "").toUpperCase();
+  let n = compact(input);
   if (/^\d{1,7}$/.test(n)) n = n.padStart(8, "0");
   if (!/^[A-Z0-9]{8}$/.test(n)) {
     throw new UserFacingError(
@@ -157,27 +157,20 @@ function authHeader(): string {
   return `Basic ${Buffer.from(`${key}:`).toString("base64")}`;
 }
 
-/** GET a Companies House path. Returns null on 404 (not found). */
-async function chGet(path: string, params: Record<string, string> = {}): Promise<unknown> {
+/** GET a Companies House path and check it against `schema`. Returns null on 404 (not found). */
+async function chGet<T>(path: string, schema: ZodType<T>, params: Record<string, string> = {}): Promise<T | null> {
   const authorization = authHeader(); // fails fast, before any network call, if the key is missing
   const url = new URL(path, BASE_URL);
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
 
-  const res = await fetchWithTimeout(url, SERVICE, {
-    headers: { Authorization: authorization, Accept: "application/json" },
+  return getJson(url, schema, {
+    service: SERVICE,
+    headers: { Authorization: authorization },
+    statusMessages: {
+      401: `Companies House rejected the API key. Check ${API_KEY_ENV} is a valid REST key.`,
+      429: "Companies House rate limit reached (600 requests per 5 minutes). Wait a few minutes and try again.",
+    },
   });
-
-  if (res.status === 404) return null;
-  if (res.status === 401) {
-    throw new UserFacingError(`Companies House rejected the API key. Check ${API_KEY_ENV} is a valid REST key.`);
-  }
-  if (res.status === 429) {
-    throw new UserFacingError(
-      "Companies House rate limit reached (600 requests per 5 minutes). Wait a few minutes and try again.",
-    );
-  }
-  if (!res.ok) throw new UserFacingError(`Companies House returned HTTP ${res.status}. Please try again later.`);
-  return res.json();
 }
 
 function notFound(companyNumber: string): UserFacingError {
@@ -186,36 +179,77 @@ function notFound(companyNumber: string): UserFacingError {
   );
 }
 
+/**
+ * Companies House can answer 404 for /officers or /filing-history of a company that does
+ * exist (for example an old dissolved company with no records online). So a 404 there only
+ * means "no such company" if the company profile is 404 too.
+ */
+async function assertCompanyExists(companyNumber: string): Promise<void> {
+  const profile = await chGet(`/company/${companyNumber}`, z.unknown());
+  if (profile === null) throw notFound(companyNumber);
+}
+
 // ---------- Public functions ----------
 
 export async function searchCompanies(query: string, limit: number): Promise<SearchResult> {
-  const raw = await chGet("/search/companies", { q: query, items_per_page: String(limit) });
-  return SearchSchema.parse(raw ?? {});
+  return (await chGet("/search/companies", SearchSchema, { q: query, items_per_page: String(limit) })) ?? {};
 }
 
 export async function getCompany(companyNumber: string): Promise<CompanyProfile> {
   const n = normalizeCompanyNumber(companyNumber);
-  const raw = await chGet(`/company/${n}`);
-  if (raw === null) throw notFound(n);
-  return ProfileSchema.parse(raw);
+  const profile = await chGet(`/company/${n}`, ProfileSchema);
+  if (profile === null) throw notFound(n);
+  return profile;
 }
 
-/** Fetches up to 100 officer records (the API maximum for one page). */
-export async function getOfficers(companyNumber: string): Promise<OfficerList> {
+const OFFICER_PAGE_SIZE = 100; // the API maximum
+const MAX_OFFICER_PAGES = 5; // at most 500 records (5 requests) per tool call
+
+/**
+ * Reads officer records 100 at a time until it has `limit` officers to show (active only,
+ * unless includeResigned), has read every record, or has read 5 pages.
+ * `officers` is null when the company exists but Companies House has no officer list for it.
+ */
+export async function getOfficers(
+  companyNumber: string,
+  options: { includeResigned: boolean; limit: number },
+): Promise<{ companyNumber: string; officers: OfficerList | null }> {
   const n = normalizeCompanyNumber(companyNumber);
-  const raw = await chGet(`/company/${n}/officers`, { items_per_page: "100" });
-  if (raw === null) throw notFound(n);
-  return OfficersSchema.parse(raw);
+  let first: OfficerList | undefined;
+  const items: Officer[] = [];
+
+  for (let page = 0; page < MAX_OFFICER_PAGES; page++) {
+    const list = await chGet(`/company/${n}/officers`, OfficersSchema, {
+      items_per_page: String(OFFICER_PAGE_SIZE),
+      start_index: String(items.length),
+    });
+    if (list === null) {
+      if (first) break; // a later page is missing: keep what we already have
+      await assertCompanyExists(n);
+      return { companyNumber: n, officers: null };
+    }
+
+    first ??= list;
+    const pageItems = list.items ?? [];
+    items.push(...pageItems);
+
+    const showable = options.includeResigned ? items.length : items.filter((o) => !o.resigned_on).length;
+    const total = first.total_results ?? items.length;
+    if (pageItems.length === 0 || items.length >= total || showable >= options.limit) break;
+  }
+  return { companyNumber: n, officers: { ...first, items } };
 }
 
+/** `filings` is null when the company exists but Companies House has no filing history for it. */
 export async function getFilingHistory(
   companyNumber: string,
   options: { limit: number; category?: FilingCategory },
-): Promise<FilingHistory> {
+): Promise<{ companyNumber: string; filings: FilingHistory | null }> {
   const n = normalizeCompanyNumber(companyNumber);
   const params: Record<string, string> = { items_per_page: String(options.limit) };
   if (options.category) params.category = options.category;
-  const raw = await chGet(`/company/${n}/filing-history`, params);
-  if (raw === null) throw notFound(n);
-  return FilingHistorySchema.parse(raw);
+
+  const filings = await chGet(`/company/${n}/filing-history`, FilingHistorySchema, params);
+  if (filings === null) await assertCompanyExists(n);
+  return { companyNumber: n, filings };
 }

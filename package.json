@@ -15,10 +15,10 @@
     "start": "node --env-file-if-exists=.env build/index.js",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "inspect": "npm run build && npx -y @modelcontextprotocol/inspector node --env-file-if-exists=.env build/index.js"
+    "inspect": "npm run build && npx -y @modelcontextprotocol/inspector@2.15.0 node --env-file-if-exists=.env build/index.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.9"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

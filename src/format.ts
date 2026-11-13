@@ -4,6 +4,11 @@
 import type { Address } from "./companiesHouse.js";
 import type { PostcodeInfo } from "./postcodes.js";
 
+/** Removes all spaces and makes it upper case: " sw1a 1aa " → "SW1A1AA". */
+export function compact(input: string): string {
+  return input.replace(/\s+/g, "").toUpperCase();
+}
+
 /** "confirmation-statement" → "Confirmation statement" */
 export function readable(code: string | undefined): string {
   if (!code) return "Unknown";
@@ -43,10 +48,34 @@ export function postcodeLines(p: PostcodeInfo): string[] {
   return lines;
 }
 
-/** Filing description codes → words, e.g. "accounts-with-accounts-type-full" → "Accounts with accounts type full". */
+// The filing `description_values` we show, with their labels. Other values are left out
+// (data minimisation: only what helps explain the filing).
+const FILING_VALUE_LABELS: Record<string, string> = {
+  made_up_date: "made up to ",
+  officer_name: "officer: ",
+  appointment_date: "appointed: ",
+  termination_date: "terminated: ",
+  change_date: "changed: ",
+  old_address: "old address: ",
+  new_address: "new address: ",
+  charge_number: "charge: ",
+  charge_creation_date: "charge created: ",
+  new_date: "new date: ",
+};
+
+/**
+ * Filing description code → words, plus the values that fill it in. For example
+ * "appoint-person-director-company-with-name-date" + { officer_name, appointment_date }
+ * → "Appoint person director company with name date (officer: Jane Smith, appointed: 2024-01-01)".
+ */
 export function describeFiling(description: string | undefined, values: Record<string, unknown> | undefined): string {
   const legacyText = typeof values?.description === "string" ? values.description : undefined;
   const text = !description || description === "legacy" ? (legacyText ?? "No description") : readable(description);
-  const madeUpTo = typeof values?.made_up_date === "string" ? ` (made up to ${values.made_up_date})` : "";
-  return text + madeUpTo;
+
+  const details: string[] = [];
+  for (const [key, label] of Object.entries(FILING_VALUE_LABELS)) {
+    const value = values?.[key];
+    if (typeof value === "string" && value.trim()) details.push(`${label}${value.trim()}`);
+  }
+  return details.length ? `${text} (${details.join(", ")})` : text;
 }

@@ -42,7 +42,7 @@ const COMPANY = {
 const OVERSEAS = {
   company_number: "FC012345",
   company_name: "OVERSEAS EXAMPLE INC",
-  company_status: "active",
+  company_status: "open", // the normal live status for overseas companies
   type: "oversea-company",
   registered_office_address: { address_line_1: "100 Main Street", locality: "New York", country: "United States" },
 };
@@ -100,6 +100,12 @@ const FILINGS = {
       category: "confirmation-statement",
       description: "confirmation-statement-with-no-updates",
       description_values: { made_up_date: "2024-06-01" },
+    },
+    {
+      date: "2024-02-01",
+      category: "officers",
+      description: "appoint-person-director-company-with-name-date",
+      description_values: { officer_name: "Jane Smith", appointment_date: "2024-01-01", other_value: "not shown" },
     },
     { date: "2010-01-01", category: "miscellaneous", description: "legacy", description_values: { description: "Old paper filing" } },
   ],
@@ -215,6 +221,17 @@ describe("tools/list", () => {
   test("sends usage instructions to the client", () => {
     assert.match(client.getInstructions() ?? "", /search_companies first/);
   });
+
+  test("output schemas use anyOf, not type arrays, for nullable fields (portable to more clients)", async () => {
+    const { tools } = await client.listTools();
+    const withOutput = tools.filter((t) => t.outputSchema);
+    assert.equal(withOutput.length, 2);
+    for (const tool of withOutput) {
+      const schema = JSON.stringify(tool.outputSchema);
+      assert.doesNotMatch(schema, /"type":\[/, `${tool.name} outputSchema has a type array`);
+      assert.match(schema, /"anyOf"/);
+    }
+  });
 });
 
 describe("search_companies", () => {
@@ -295,6 +312,19 @@ describe("get_company", () => {
     assert.equal(requests.length, 0);
   });
 
+  test("'open' (overseas companies) counts as live: no 'not active' warning", async () => {
+    const result = await call("get_company", { company_number: "FC012345" });
+    assert.equal(result.isError, undefined);
+    assert.deepEqual((result.structuredContent as { warnings: string[] }).warnings, []);
+  });
+
+  test("a company in liquidation gets a 'not active' warning", async () => {
+    route = (url) =>
+      url.pathname === "/company/12345678" ? json({ ...COMPANY, company_status: "liquidation" }) : defaultRoute(url);
+    const result = await call("get_company", { company_number: "12345678" });
+    assert.match(text(result), /Company status is "Liquidation", not active\./);
+  });
+
   test("path tricks are rejected by input validation", async () => {
     const outcome = await call("get_company", { company_number: "../search" })
       .then((r) => r.isError === true)
@@ -341,7 +371,39 @@ describe("API key and error handling", () => {
     route = () => json({ company_name: 42 });
     const result = await call("get_company", { company_number: "12345678" });
     assert.equal(result.isError, true);
-    assert.match(text(result), /Unexpected error/);
+    assert.match(text(result), /Companies House sent data in an unexpected format/);
+    assert.doesNotMatch(text(result), /company_name|invalid_type/);
+  });
+
+  test("timeout gives a 'timed out' message", async () => {
+    route = () => {
+      throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    };
+    const result = await call("get_company", { company_number: "12345678" });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /Companies House timed out\. Please try again\./);
+  });
+
+  test("timeout while reading the response body also says 'timed out'", async () => {
+    route = () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+          },
+        }),
+        { status: 200 },
+      );
+    const result = await call("get_company", { company_number: "12345678" });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /Companies House timed out/);
+  });
+
+  test("a body that is not JSON gives a safe message", async () => {
+    route = () => new Response("<html>Service unavailable</html>", { status: 200 });
+    const result = await call("get_company", { company_number: "12345678" });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /Companies House sent a response that could not be read/);
   });
 });
 
@@ -366,20 +428,92 @@ describe("get_officers", () => {
       assert.ok(!all.includes(personal), `output should not contain "${personal}"`);
     }
   });
+
+  test("reads the next page when the first 100 records have too few active officers", async () => {
+    const pastDirectors = Array.from({ length: 100 }, (_, i) => ({
+      name: `PAST, Person ${i}`,
+      officer_role: "director",
+      appointed_on: "2000-01-01",
+      resigned_on: "2001-01-01",
+    }));
+    route = (url) => {
+      if (url.pathname !== "/company/12345678/officers") return defaultRoute(url);
+      const items =
+        url.searchParams.get("start_index") === "0"
+          ? pastDirectors
+          : [{ name: "CURRENT, Director", officer_role: "director", appointed_on: "2020-01-01" }];
+      return json({ total_results: 101, active_count: 1, resigned_count: 100, items });
+    };
+    const out = text(await call("get_officers", { company_number: "12345678" }));
+    assert.match(out, /Company 12345678: 1 active and 100 resigned officers\./);
+    assert.match(out, /1\. CURRENT, Director — Director, appointed 2020-01-01/);
+    assert.deepEqual(
+      requests.map((r) => r.url.searchParams.get("start_index")),
+      ["0", "100"],
+    );
+  });
+
+  test("stops after 5 pages (500 records) and says not all were checked", async () => {
+    route = (url) => {
+      const start = Number(url.searchParams.get("start_index"));
+      const items = Array.from({ length: 100 }, (_, i) => ({
+        name: `PAST, Person ${start + i}`,
+        officer_role: "director",
+        resigned_on: "2001-01-01",
+      }));
+      return json({ total_results: 1000, active_count: 0, resigned_count: 1000, items });
+    };
+    const out = text(await call("get_officers", { company_number: "12345678" }));
+    assert.equal(requests.length, 5);
+    assert.match(out, /Only the first 500 of 1000 officer records were checked/);
+  });
+
+  test("no officer list for a company that exists is a normal result, not 'not found'", async () => {
+    route = (url) => (url.pathname === "/company/12345678/officers" ? json({}, 404) : defaultRoute(url));
+    const result = await call("get_officers", { company_number: "12345678" });
+    assert.equal(result.isError, undefined);
+    assert.match(text(result), /Companies House has no officer records for company 12345678/);
+  });
+
+  test("unknown company number still gives 'No company found'", async () => {
+    const result = await call("get_officers", { company_number: "99999999" });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /No company found with number 99999999/);
+    assert.deepEqual(
+      requests.map((r) => r.url.pathname),
+      ["/company/99999999/officers", "/company/99999999"],
+    );
+  });
 });
 
 describe("get_filing_history", () => {
   test("lists filings in plain words", async () => {
-    const out = text(await call("get_filing_history", { company_number: "12345678", limit: 3 }));
-    assert.match(out, /Filing history for 12345678, showing 3 of 25:/);
+    const out = text(await call("get_filing_history", { company_number: "12345678", limit: 4 }));
+    assert.match(out, /Filing history for 12345678, showing 4 of 25:/);
     assert.match(out, /2025-03-20 · Accounts · Accounts with accounts type micro entity \(made up to 2024-06-30\)/);
     assert.match(out, /2024-06-20 · Confirmation statement · Confirmation statement with no updates/);
     assert.match(out, /2010-01-01 · Miscellaneous · Old paper filing/);
   });
 
+  test("fills in who and when from the filing's values, and leaves other values out", async () => {
+    const out = text(await call("get_filing_history", { company_number: "12345678" }));
+    assert.match(
+      out,
+      /2024-02-01 · Officers · Appoint person director company with name date \(officer: Jane Smith, appointed: 2024-01-01\)/,
+    );
+    assert.doesNotMatch(out, /not shown/);
+  });
+
   test("passes the category filter to the API", async () => {
     await call("get_filing_history", { company_number: "12345678", category: "accounts" });
     assert.equal(requests[0]?.url.searchParams.get("category"), "accounts");
+  });
+
+  test("no filing history for a company that exists is a normal result, not 'not found'", async () => {
+    route = (url) => (url.pathname === "/company/12345678/filing-history" ? json({}, 404) : defaultRoute(url));
+    const result = await call("get_filing_history", { company_number: "12345678" });
+    assert.equal(result.isError, undefined);
+    assert.match(text(result), /Companies House has no filing history for company 12345678/);
   });
 });
 
@@ -438,6 +572,14 @@ describe("get_company_location", () => {
       requests.map((r) => r.url.hostname),
       [CH_HOST, PC_HOST],
     );
+  });
+
+  test("if postcodes.io fails, still returns the company and its address", async () => {
+    route = (url) => (url.hostname === PC_HOST ? json({}, 429) : defaultRoute(url));
+    const result = await call("get_company_location", { company_number: "12345678" });
+    assert.equal(result.isError, undefined);
+    assert.match(text(result), /Registered office: 1 Example Street, London, SW1A 1AA, England/);
+    assert.match(text(result), /Area details are not available right now: postcodes.io rate limit reached/);
   });
 
   test("company with no UK postcode is a normal result with the address only", async () => {
